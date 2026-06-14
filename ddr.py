@@ -8,14 +8,12 @@ import os
 import sys
 import subprocess
 import importlib
-import glob
-from collections import defaultdict
+import re
 
 # ------------------------------
 # Auto-install missing dependencies
 # ------------------------------
 def install_package(package):
-    """Try to install missing package using pip"""
     print(f"⚠️  Missing dependency: {package}. Attempting auto-install...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", package])
@@ -27,7 +25,6 @@ def install_package(package):
         return False
 
 def check_and_install_dependencies():
-    """Check rawpy and numpy, install if missing"""
     deps = ["rawpy", "numpy"]
     for dep in deps:
         try:
@@ -37,63 +34,63 @@ def check_and_install_dependencies():
                 sys.exit(1)
     print("✅ All dependencies ready")
 
-# Check environment at startup
 check_and_install_dependencies()
 
 import rawpy
 import numpy as np
 
 # ------------------------------
+# Path cleaning (handles escaped spaces and quotes)
+# ------------------------------
+def clean_path(p):
+    """Convert shell-escaped spaces and remove surrounding quotes."""
+    # Remove surrounding quotes first
+    p = p.strip()
+    if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+        p = p[1:-1]
+    # Replace backslash-space with space (common in dragged paths)
+    p = re.sub(r'\\ ', ' ', p)
+    # Also replace any remaining backslashes (except those part of a valid path on Windows)
+    # On macOS/Linux, backslashes are not path separators, so remove them
+    p = p.replace('\\', '')
+    return p.strip()
+
+# ------------------------------
 # Constants
 # ------------------------------
-DR_JUMP_THRESH = 0.25      # DR jump threshold (EV)
-NOISE_DROP_FACTOR = 0.75   # Noise drop factor
-FUSION_IMPROVEMENT = 0.35  # Fusion mode improvement threshold
+DR_JUMP_THRESH = 0.25
 
 # ------------------------------
-# Core analysis function
+# Core analysis
 # ------------------------------
 def analyze_raw(filepath, snr=1.0):
-    """
-    Analyze a single RAW file
-    Returns: dict {iso, bl, rn, dr}
-    """
     try:
         with rawpy.imread(filepath) as raw:
-            # ISO
             iso = float(raw.other.iso_speed or 0)
             if iso == 0:
-                # fallback
                 iso = 100
 
-            # Image data
             img = raw.raw_image.astype(np.float32)
             if img.ndim == 3:
                 img = np.mean(img, axis=2)
             h, w = img.shape[:2]
 
-            # White level
             max_dn = getattr(raw, 'white_level', None)
             if max_dn is None or max_dn < 100:
                 max_dn = np.percentile(img, 99.99)
 
-            # Black level
             if hasattr(raw, 'black_level_per_channel') and raw.black_level_per_channel:
                 blv = [b for b in raw.black_level_per_channel if b is not None]
                 bl = np.mean(blv) if blv else np.percentile(img, 1)
             else:
                 bl = np.percentile(img, 1)
 
-            # ROI: central 50% area (fixed)
             mh, mw = h//4, w//4
             roi = img[mh:h-mh, mw:w-mw] - bl
             rn = np.std(roi, ddof=1)
 
             sat = max_dn - bl
-            if sat > 0 and rn > 0:
-                dr = np.log2(sat / (snr * rn))
-            else:
-                dr = 0.0
+            dr = np.log2(sat / (snr * rn)) if sat>0 and rn>0 else 0.0
 
             return {
                 'iso': iso,
@@ -107,7 +104,7 @@ def analyze_raw(filepath, snr=1.0):
         return None
 
 def get_all_raw_files(path):
-    """Recursively get all RAW files"""
+    """Return list of RAW files. Works for both file and directory."""
     raw_exts = ('.dng','.cr2','.cr3','.nef','.arw','.orf','.rw2','.pef','.raf','.3fr','.fff')
     if os.path.isfile(path):
         if path.lower().endswith(raw_exts):
@@ -125,7 +122,6 @@ def get_all_raw_files(path):
         return []
 
 def classify_gain_type(iso_dr_list):
-    """Classify gain type based on ISO-DR pairs"""
     if len(iso_dr_list) < 3:
         return "Insufficient data (need >=3 ISO points)"
     isos = [item[0] for item in iso_dr_list]
@@ -150,29 +146,40 @@ def main():
     print(" Lightweight - Drag & drop RAW file/folder to analyze")
     print("="*60 + "\n")
 
-    # Get input path
     if len(sys.argv) > 1:
-        input_path = sys.argv[1]
+        raw_path = ' '.join(sys.argv[1:])
     else:
-        input_path = input("Please drag & drop a RAW file or folder, then press Enter: ").strip().strip("'\"")
+        raw_path = input("Please drag & drop a RAW file or folder, then press Enter: ").strip()
 
-    if not input_path:
+    clean_path_str = clean_path(raw_path)
+
+    print(f"🔍 Raw input: {raw_path}")
+    print(f"🔍 Cleaned path: {clean_path_str}")
+
+    if not clean_path_str:
         print("❌ No valid path provided")
         input("Press Enter to exit...")
         sys.exit(0)
 
-    # Get all RAW files
-    raw_files = get_all_raw_files(input_path)
-    if not raw_files:
-        print(f"❌ No RAW files found: {input_path}")
+    if not os.path.exists(clean_path_str):
+        print(f"❌ Path does not exist: {clean_path_str}")
         input("Press Enter to exit...")
         sys.exit(0)
 
-    print(f"📸 Found {len(raw_files)} RAW file(s). Analyzing...\n")
+    raw_files = get_all_raw_files(clean_path_str)
+    print(f"🔍 Found {len(raw_files)} RAW file(s)")
+
+    if not raw_files:
+        print(f"❌ No RAW files found at: {clean_path_str}")
+        print("   Supported formats: .dng, .cr2, .cr3, .nef, .arw, .orf, .rw2, .pef, .raf, .3fr, .fff")
+        input("Press Enter to exit...")
+        sys.exit(0)
+
+    print(f"📸 Analyzing {len(raw_files)} file(s)...\n")
 
     results = []
     for f in raw_files:
-        print(f"  Analyzing: {os.path.basename(f)} ...")
+        print(f"  Processing: {os.path.basename(f)} ...")
         res = analyze_raw(f)
         if res:
             results.append(res)
@@ -182,10 +189,8 @@ def main():
         input("Press Enter to exit...")
         sys.exit(0)
 
-    # Sort by ISO
     results.sort(key=lambda x: x['iso'])
 
-    # Output table
     print("\n" + "-"*70)
     print(f"{'ISO':>6}  {'BL(DN)':>8}  {'RN(DN)':>8}  {'DR(EV)':>8}  {'File':>30}")
     print("-"*70)
@@ -193,7 +198,6 @@ def main():
         print(f"{r['iso']:6.0f}  {r['bl']:8.2f}  {r['rn']:8.4f}  {r['dr']:8.2f}  {r['file']:30}")
     print("-"*70)
 
-    # Gain type classification
     iso_dr_list = [(r['iso'], r['dr']) for r in results]
     gain_type = classify_gain_type(iso_dr_list)
     print(f"\n📊 Gain type: {gain_type}")
